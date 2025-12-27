@@ -1,0 +1,10 @@
+{
+  "mode": "osr_threshold",
+  "threshold": 0.9974055886268616,
+  "known_classes": {
+    "0": "aircraft",
+    "1": "bird",
+    "2": "drone"
+  },
+  "unknown_label": 3
+}
