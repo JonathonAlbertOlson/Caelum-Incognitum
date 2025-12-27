@@ -1,0 +1,29 @@
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# ML artifacts (adjust as needed)
+runs/
+wandb/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.h5
+
+# Secrets
+.env
