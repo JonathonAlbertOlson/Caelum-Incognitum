@@ -1,7 +1,7 @@
 Getting Started:
 1) Open project folder
-2) Model training: python train_cnn_autosplit.py --data_root data --pretrained --train_unknown 0 --num_workers 4
-3) Test Model output through the included jupyter notebook "test_model_notebook.ipynb"
+2) For model training, enter this into the terminal: python train_cnn_autosplit.py --data_root data --pretrained --train_unknown 0 --num_workers 4
+3) Test model output through the included jupyter notebook "test_model_notebook.ipynb"
 
 Data Sources:  
 https://www.kaggle.com/datasets/imbikramsaha/drone-bird-classification  
