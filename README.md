@@ -39,3 +39,10 @@ https://www.kaggle.com/datasets/cybersimar08/drone-detection
 https://www.kaggle.com/datasets/sonainjamil/malicious-drones  
 https://www.kaggle.com/datasets/dolphinramses/clouds  
 https://www.kaggle.com/datasets/serhiibiruk/balloon-object-detection  
+
+
+# Gradio?
+```py
+# Just run in vsc
+python app.py
+```
