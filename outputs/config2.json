@@ -1,12 +1,11 @@
 {
   "mode": "osr_threshold",
-  "osr_method": "energy",
-  "threshold": 5.734517574310303,
+  "osr_method": "confidence",
+  "threshold": 0.9990180730819702,
   "known_classes": {
     "0": "aircraft",
     "1": "bird",
     "2": "drone"
   },
-  "unknown_label": 3,
-  "energy_temperature": 1.0
+  "unknown_label": 3
 }

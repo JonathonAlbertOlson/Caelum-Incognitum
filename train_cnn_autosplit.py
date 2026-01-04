@@ -95,10 +95,39 @@ def make_weighted_sampler(targets: List[int]) -> WeightedRandomSampler:
 
 
 # ----------------------------
-# OSR scoring (post-hoc unknown)
+# OSR scoring methods
 # ----------------------------
 def confidence_score(logits: torch.Tensor) -> torch.Tensor:
+    """
+    Max softmax probability. Higher = more confident = more likely known.
+    """
     return F.softmax(logits, dim=1).max(dim=1).values
+
+
+def energy_score(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    """
+    Energy-based score: E(x) = -T * log(sum(exp(logits/T)))
+    
+    Lower energy = more likely in-distribution (known).
+    Higher energy = more likely out-of-distribution (unknown).
+    
+    Reference: "Energy-based Out-of-distribution Detection" (Liu et al., 2020)
+    """
+    return -temperature * torch.logsumexp(logits / temperature, dim=1)
+
+
+def get_osr_scores(logits: torch.Tensor, method: str, temperature: float = 1.0) -> torch.Tensor:
+    """
+    Compute OSR scores. Returns scores where HIGHER = more likely KNOWN.
+    For energy, we negate since lower energy = known.
+    """
+    if method == "confidence":
+        return confidence_score(logits)
+    elif method == "energy":
+        # Negate energy so higher score = more likely known (consistent interface)
+        return -energy_score(logits, temperature)
+    else:
+        raise ValueError(f"Unknown OSR method: {method}")
 
 
 @torch.no_grad()
@@ -114,26 +143,28 @@ def collect_logits_labels(model: nn.Module, loader: DataLoader, device: torch.de
 
 
 @torch.no_grad()
-def collect_scores(model: nn.Module, loader: DataLoader, device: torch.device) -> np.ndarray:
+def collect_scores(model: nn.Module, loader: DataLoader, device: torch.device,
+                   method: str, temperature: float = 1.0) -> np.ndarray:
+    """Collect OSR scores for all samples in loader."""
     model.eval()
     scores = []
     for x, _ in loader:
         x = x.to(device)
         logits = model(x)
-        scores.append(confidence_score(logits).cpu().numpy())
+        scores.append(get_osr_scores(logits, method, temperature).cpu().numpy())
     return np.concatenate(scores)
 
 
 def choose_threshold(known_scores: np.ndarray, unknown_scores: np.ndarray) -> float:
     """
-    Choose threshold that maximizes Youden's J = TPR - FPR
-    unknown if confidence < thr
+    Choose threshold that maximizes Youden's J = TPR - FPR.
+    Samples are classified as unknown if score < threshold.
     """
     all_scores = np.unique(np.concatenate([known_scores, unknown_scores]))
     best_thr, best_J = None, -1e9
 
     for thr in all_scores:
-        tpr = (known_scores >= thr).mean()
+        tpr = (known_scores >= thr).mean()   # known correctly accepted
         fpr = (unknown_scores >= thr).mean()  # unknown wrongly accepted as known
         J = tpr - fpr
         if J > best_J:
@@ -220,6 +251,20 @@ def main():
              "1: train as 4th class (closed-set).",
     )
 
+    # OSR scoring method
+    ap.add_argument(
+        "--osr_method",
+        choices=["confidence", "energy"],
+        default="confidence",
+        help="OSR scoring method: 'confidence' (max softmax) or 'energy' (energy-based).",
+    )
+    ap.add_argument(
+        "--energy_temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for energy-based scoring (only used if osr_method='energy').",
+    )
+
     args = ap.parse_args()
     set_seed(args.seed)
 
@@ -227,7 +272,14 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Device selection: CUDA > MPS (Apple Silicon) > CPU
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    print(f"Using device: {device}")
 
     # Transforms
     train_tfms = transforms.Compose([
@@ -380,19 +432,27 @@ def main():
     unk_logits, _ = collect_logits_labels(model, test_loader_unk, device)
 
     # Threshold calibration using validation known + validation unknown
-    val_known_scores = collect_scores(model, val_loader_known, device)
-    val_unk_scores = collect_scores(model, val_loader_unk, device)
+    osr_method = args.osr_method
+    temperature = args.energy_temperature
+
+    val_known_scores = collect_scores(model, val_loader_known, device, osr_method, temperature)
+    val_unk_scores = collect_scores(model, val_loader_unk, device, osr_method, temperature)
     thr = choose_threshold(val_known_scores, val_unk_scores)
-    print(f"\nChosen OSR confidence threshold: {thr:.6f} (unknown if max_softmax < thr)")
+
+    method_desc = f"{osr_method}" + (f" (T={temperature})" if osr_method == "energy" else "")
+    print(f"\nOSR method: {method_desc}")
+    print(f"Chosen threshold: {thr:.6f} (unknown if score < threshold)")
 
     # Predict with rejection
     all_logits = np.concatenate([known_logits, unk_logits], axis=0)
     t = torch.from_numpy(all_logits)
-    conf = confidence_score(t).numpy()
+    
+    # Get OSR scores using selected method
+    scores = get_osr_scores(t, osr_method, temperature).numpy()
     base_preds = t.argmax(dim=1).numpy()
 
     pred = base_preds.copy()
-    pred[conf < thr] = unknown_label
+    pred[scores < thr] = unknown_label
 
     true = np.concatenate([known_y, np.full(len(unk_logits), unknown_label)], axis=0)
 
@@ -401,8 +461,9 @@ def main():
     pred_is_unknown = (pred == unknown_label).astype(int)
     f1_unk = f1_score(true_is_unknown, pred_is_unknown)
 
-    # AUROC where higher means more unknown-likely
-    auroc = roc_auc_score(true_is_unknown, 1.0 - conf)
+    # AUROC: higher score = more known, so for unknown detection we use (1 - normalized_score)
+    # Actually, we want P(unknown | score), so lower score = more unknown
+    auroc = roc_auc_score(true_is_unknown, -scores)
 
     print("\nOpen-set results (3 known classes + unknown rejection):")
     print(f"Open-set accuracy: {open_acc:.4f}")
@@ -416,10 +477,14 @@ def main():
     compact_idx_to_name = {i: idx_to_class[old] for i, old in enumerate(known_class_ids)}
     cfg = {
         "mode": "osr_threshold",
+        "osr_method": osr_method,
         "threshold": thr,
         "known_classes": compact_idx_to_name,  # 0..2 -> name
         "unknown_label": unknown_label,
     }
+    if osr_method == "energy":
+        cfg["energy_temperature"] = temperature
+    
     (out_dir / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     print(f"\nSaved inference config: {out_dir / 'config.json'}")
 
