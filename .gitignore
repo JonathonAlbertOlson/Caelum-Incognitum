@@ -27,3 +27,5 @@ checkpoints/
 
 # Secrets
 .env
+
+.gradio
