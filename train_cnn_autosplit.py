@@ -3,7 +3,7 @@ import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
 import torch
@@ -12,9 +12,22 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from torchvision import datasets, models, transforms
 
-from sklearn.metrics import classification_report, accuracy_score, f1_score, roc_auc_score
+from sklearn.metrics import (
+    classification_report,
+    accuracy_score,
+    f1_score,
+    roc_auc_score,
+)
 
+
+# ----------------------------
+# Dataset wrappers
+# ----------------------------
 class CompactSubset(torch.utils.data.Dataset):
+    """
+    Wrap a subset and remap its labels using `mapping` so labels become contiguous [0..K-1].
+    """
+
     def __init__(self, subset, mapping: dict):
         self.subset = subset
         self.mapping = mapping
@@ -28,6 +41,10 @@ class CompactSubset(torch.utils.data.Dataset):
 
 
 class DummyLabelSubset(torch.utils.data.Dataset):
+    """
+    Wrap a subset but ignore its label (useful for unknown samples where we only need images).
+    """
+
     def __init__(self, subset):
         self.subset = subset
 
@@ -37,6 +54,7 @@ class DummyLabelSubset(torch.utils.data.Dataset):
     def __getitem__(self, i):
         x, _ = self.subset[i]
         return x, 0
+
 
 # ----------------------------
 # Reproducibility
@@ -53,9 +71,14 @@ def set_seed(seed: int) -> None:
 # ----------------------------
 # Splitting utilities
 # ----------------------------
-def stratified_split(indices: np.ndarray, labels: np.ndarray,
-                     train_frac: float, val_frac: float, test_frac: float,
-                     seed: int) -> Tuple[List[int], List[int], List[int]]:
+def stratified_split(
+    indices: np.ndarray,
+    labels: np.ndarray,
+    train_frac: float,
+    val_frac: float,
+    test_frac: float,
+    seed: int,
+) -> Tuple[List[int], List[int], List[int]]:
     """
     Stratified split over the provided indices/labels.
     """
@@ -64,8 +87,8 @@ def stratified_split(indices: np.ndarray, labels: np.ndarray,
 
     train_idx, val_idx, test_idx = [], [], []
     for cls in np.unique(labels):
-        cls_mask = (labels == cls)
-        cls_indices = indices[cls_mask]
+        cls_mask = labels == cls
+        cls_indices = indices[cls_mask].copy()
         rng.shuffle(cls_indices)
 
         n = len(cls_indices)
@@ -75,8 +98,8 @@ def stratified_split(indices: np.ndarray, labels: np.ndarray,
         n_val = min(n_val, n - n_train)
 
         train_idx.extend(cls_indices[:n_train].tolist())
-        val_idx.extend(cls_indices[n_train:n_train + n_val].tolist())
-        test_idx.extend(cls_indices[n_train + n_val:].tolist())
+        val_idx.extend(cls_indices[n_train : n_train + n_val].tolist())
+        test_idx.extend(cls_indices[n_train + n_val :].tolist())
 
     rng.shuffle(train_idx)
     rng.shuffle(val_idx)
@@ -85,13 +108,15 @@ def stratified_split(indices: np.ndarray, labels: np.ndarray,
 
 
 def make_weighted_sampler(targets: List[int]) -> WeightedRandomSampler:
-    targets = np.array(targets)
-    class_counts = np.bincount(targets)
+    targets_np = np.asarray(targets, dtype=int)
+    class_counts = np.bincount(targets_np)
     class_counts = np.maximum(class_counts, 1)
     class_weights = 1.0 / class_counts
-    sample_weights = class_weights[targets]
+    sample_weights = class_weights[targets_np]
     sample_weights = torch.as_tensor(sample_weights, dtype=torch.double)
-    return WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+    return WeightedRandomSampler(
+        sample_weights, num_samples=len(sample_weights), replacement=True
+    )
 
 
 # ----------------------------
@@ -106,32 +131,34 @@ def confidence_score(logits: torch.Tensor) -> torch.Tensor:
 
 def energy_score(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
     """
-    Energy-based score: E(x) = -T * log(sum(exp(logits/T)))
-    
-    Lower energy = more likely in-distribution (known).
-    Higher energy = more likely out-of-distribution (unknown).
-    
-    Reference: "Energy-based Out-of-distribution Detection" (Liu et al., 2020)
+    Energy-based score: E(x) = -T * log(sum(exp(logits/T))).
+
+    Lower (more negative) energy = more likely in-distribution (known).
+    Higher (less negative) energy = more likely out-of-distribution (unknown).
     """
     return -temperature * torch.logsumexp(logits / temperature, dim=1)
 
 
-def get_osr_scores(logits: torch.Tensor, method: str, temperature: float = 1.0) -> torch.Tensor:
+def get_osr_scores(
+    logits: torch.Tensor, method: str, temperature: float = 1.0
+) -> torch.Tensor:
     """
-    Compute OSR scores. Returns scores where HIGHER = more likely KNOWN.
-    For energy, we negate since lower energy = known.
+    Returns scores where HIGHER = more likely KNOWN.
+
+    - confidence: higher max-softmax => more known
+    - energy: lower energy => more known, so we negate energy to keep the interface consistent
     """
     if method == "confidence":
         return confidence_score(logits)
-    elif method == "energy":
-        # Negate energy so higher score = more likely known (consistent interface)
+    if method == "energy":
         return -energy_score(logits, temperature)
-    else:
-        raise ValueError(f"Unknown OSR method: {method}")
+    raise ValueError(f"Unknown OSR method: {method}")
 
 
 @torch.no_grad()
-def collect_logits_labels(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[np.ndarray, np.ndarray]:
+def collect_logits_labels(
+    model: nn.Module, loader: DataLoader, device: torch.device
+) -> Tuple[np.ndarray, np.ndarray]:
     model.eval()
     logits_list, y_list = [], []
     for x, y in loader:
@@ -143,9 +170,13 @@ def collect_logits_labels(model: nn.Module, loader: DataLoader, device: torch.de
 
 
 @torch.no_grad()
-def collect_scores(model: nn.Module, loader: DataLoader, device: torch.device,
-                   method: str, temperature: float = 1.0) -> np.ndarray:
-    """Collect OSR scores for all samples in loader."""
+def collect_scores(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    method: str,
+    temperature: float = 1.0,
+) -> np.ndarray:
     model.eval()
     scores = []
     for x, _ in loader:
@@ -164,11 +195,14 @@ def choose_threshold(known_scores: np.ndarray, unknown_scores: np.ndarray) -> fl
     best_thr, best_J = None, -1e9
 
     for thr in all_scores:
-        tpr = (known_scores >= thr).mean()   # known correctly accepted
+        tpr = (known_scores >= thr).mean()    # known correctly accepted
         fpr = (unknown_scores >= thr).mean()  # unknown wrongly accepted as known
         J = tpr - fpr
         if J > best_J:
             best_J, best_thr = J, float(thr)
+
+    if best_thr is None:
+        raise RuntimeError("Threshold selection failed (no scores available).")
     return best_thr
 
 
@@ -177,11 +211,15 @@ def choose_threshold(known_scores: np.ndarray, unknown_scores: np.ndarray) -> fl
 # ----------------------------
 def build_model(num_classes: int, backbone: str, pretrained: bool) -> nn.Module:
     if backbone == "resnet18":
-        model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT if pretrained else None)
+        model = models.resnet18(
+            weights=models.ResNet18_Weights.DEFAULT if pretrained else None
+        )
         model.fc = nn.Linear(model.fc.in_features, num_classes)
         return model
     if backbone == "resnet50":
-        model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT if pretrained else None)
+        model = models.resnet50(
+            weights=models.ResNet50_Weights.DEFAULT if pretrained else None
+        )
         model.fc = nn.Linear(model.fc.in_features, num_classes)
         return model
     raise ValueError("backbone must be resnet18 or resnet50")
@@ -193,8 +231,12 @@ class EpochStats:
     acc: float
 
 
-def run_epoch(model: nn.Module, loader: DataLoader, device: torch.device,
-              optimizer: torch.optim.Optimizer | None) -> EpochStats:
+def run_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer | None,
+) -> EpochStats:
     is_train = optimizer is not None
     model.train(is_train)
 
@@ -219,12 +261,20 @@ def run_epoch(model: nn.Module, loader: DataLoader, device: torch.device,
 
     preds_all = np.concatenate(preds_all)
     y_all = np.concatenate(y_all)
-    return EpochStats(loss=total_loss / len(loader.dataset), acc=accuracy_score(y_all, preds_all))
+    return EpochStats(
+        loss=total_loss / len(loader.dataset),
+        acc=accuracy_score(y_all, preds_all),
+    )
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data_root", type=str, required=True, help="Folder containing aircraft/drone/bird/unknown subfolders.")
+    ap.add_argument(
+        "--data_root",
+        type=str,
+        required=True,
+        help="Folder containing aircraft/drone/bird/unknown subfolders.",
+    )
     ap.add_argument("--out_dir", type=str, default="outputs")
     ap.add_argument("--seed", type=int, default=42)
 
@@ -242,21 +292,12 @@ def main():
     ap.add_argument("--val_frac", type=float, default=0.15)
     ap.add_argument("--test_frac", type=float, default=0.15)
 
-    ap.add_argument(
-        "--train_unknown",
-        type=int,
-        choices=[0, 1],
-        default=0,
-        help="0: recommended OSR (unknown not used for training; used for threshold/test). "
-             "1: train as 4th class (closed-set).",
-    )
-
     # OSR scoring method
     ap.add_argument(
         "--osr_method",
         choices=["confidence", "energy"],
         default="confidence",
-        help="OSR scoring method: 'confidence' (max softmax) or 'energy' (energy-based).",
+        help="OSR scoring method used for threshold-based rejection.",
     )
     ap.add_argument(
         "--energy_temperature",
@@ -282,20 +323,24 @@ def main():
     print(f"Using device: {device}")
 
     # Transforms
-    train_tfms = transforms.Compose([
-        transforms.Resize((args.img_size, args.img_size)),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(10),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
-    eval_tfms = transforms.Compose([
-        transforms.Resize((args.img_size, args.img_size)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
+    train_tfms = transforms.Compose(
+        [
+            transforms.Resize((args.img_size, args.img_size)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(10),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
+    eval_tfms = transforms.Compose(
+        [
+            transforms.Resize((args.img_size, args.img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
 
-    # Load full dataset once for indices/targets, then reload with different transforms
+    # Load dataset twice: train uses augmentation; eval is deterministic
     ds_all_train = datasets.ImageFolder(str(data_root), transform=train_tfms)
     ds_all_eval = datasets.ImageFolder(str(data_root), transform=eval_tfms)
 
@@ -304,137 +349,169 @@ def main():
 
     required = {"aircraft", "drone", "bird", "unknown"}
     if set(class_to_idx.keys()) != required:
-        raise ValueError(f"Expected exactly folders {sorted(required)} under {data_root}, got {sorted(class_to_idx.keys())}")
+        raise ValueError(
+            f"Expected exactly folders {sorted(required)} under {data_root}, "
+            f"got {sorted(class_to_idx.keys())}"
+        )
 
     unknown_idx = class_to_idx["unknown"]
 
-    targets = np.array(ds_all_train.targets)
+    targets = np.array(ds_all_train.targets, dtype=int)
     all_indices = np.arange(len(targets))
 
-    if args.train_unknown == 1:
-        # 4-way classification (unknown included in training)
-        train_idx, val_idx, test_idx = stratified_split(
-            all_indices, targets, args.train_frac, args.val_frac, args.test_frac, args.seed
-        )
+    # ----------------------------
+    # IMPORTANT: unknown is NEVER used for training
+    # ----------------------------
+    known_mask = targets != unknown_idx
+    unk_mask = targets == unknown_idx
 
-        num_classes = 4
-        unknown_label = unknown_idx  # normal class id
+    known_indices = all_indices[known_mask]
+    known_labels = targets[known_mask]
 
-        train_subset = Subset(ds_all_train, train_idx)
-        val_subset = Subset(ds_all_eval, val_idx)
-        test_subset = Subset(ds_all_eval, test_idx)
+    unk_indices = all_indices[unk_mask]
 
-        train_targets = [targets[i] for i in train_idx]
-        sampler = make_weighted_sampler(train_targets)
+    # Split KNOWN into train/val/test (stratified)
+    known_train_idx, known_val_idx, known_test_idx = stratified_split(
+        known_indices,
+        known_labels,
+        args.train_frac,
+        args.val_frac,
+        args.test_frac,
+        args.seed,
+    )
 
-        train_loader = DataLoader(train_subset, batch_size=args.batch_size, sampler=sampler, num_workers=args.num_workers)
-        val_loader = DataLoader(val_subset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-        test_loader = DataLoader(test_subset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    # Split UNKNOWN into val/test only (no training)
+    rng = np.random.default_rng(args.seed)
+    rng.shuffle(unk_indices)
+    cut = len(unk_indices) // 2
+    unk_val_idx = unk_indices[:cut].tolist()
+    unk_test_idx = unk_indices[cut:].tolist()
 
-    else:
-        # Recommended OSR: train only on known classes; unknown used for thresholding/test.
-        known_mask = targets != unknown_idx
-        unk_mask = targets == unknown_idx
+    # Build subsets
+    train_subset = Subset(ds_all_train, known_train_idx)  # known only
+    val_subset_known = Subset(ds_all_eval, known_val_idx)
+    test_subset_known = Subset(ds_all_eval, known_test_idx)
 
-        known_indices = all_indices[known_mask]
-        known_labels = targets[known_mask]
+    val_subset_unk = Subset(ds_all_eval, unk_val_idx)
+    test_subset_unk = Subset(ds_all_eval, unk_test_idx)
 
-        unk_indices = all_indices[unk_mask]
-        unk_labels = targets[unk_mask]  # all unknown_idx
+    # Remap known labels to [0..2] in a stable way
+    known_class_ids = sorted(
+        [class_to_idx["aircraft"], class_to_idx["bird"], class_to_idx["drone"]]
+    )
+    compact_map = {old: new for new, old in enumerate(known_class_ids)}
+    compact_idx_to_name = {new: idx_to_class[old] for old, new in compact_map.items()}
 
-        # Split known into train/val/test
-        known_train_idx, known_val_idx, known_test_idx = stratified_split(
-            known_indices, known_labels, args.train_frac, args.val_frac, args.test_frac, args.seed
-        )
+    train_subset = CompactSubset(train_subset, compact_map)
+    val_subset_known = CompactSubset(val_subset_known, compact_map)
+    test_subset_known = CompactSubset(test_subset_known, compact_map)
 
-        # Split unknown into (val/test) only (no training)
-        # 50/50 between val and test by default
-        rng = np.random.default_rng(args.seed)
-        rng.shuffle(unk_indices)
-        cut = len(unk_indices) // 2
-        unk_val_idx = unk_indices[:cut].tolist()
-        unk_test_idx = unk_indices[cut:].tolist()
+    # Unknown subsets: labels are irrelevant (only used to compute scores)
+    val_subset_unk = DummyLabelSubset(val_subset_unk)
+    test_subset_unk = DummyLabelSubset(test_subset_unk)
 
-        # Build subsets
-        train_subset = Subset(ds_all_train, known_train_idx)  # only known
-        val_subset_known = Subset(ds_all_eval, known_val_idx)
-        val_subset_unk = Subset(ds_all_eval, unk_val_idx)
-        test_subset_known = Subset(ds_all_eval, known_test_idx)
-        test_subset_unk = Subset(ds_all_eval, unk_test_idx)
+    # Balanced sampling for training (known only)
+    train_targets_compact = [compact_map[int(targets[i])] for i in known_train_idx]
+    sampler = make_weighted_sampler(train_targets_compact)
 
-        # Remap labels for training to [0..2] (aircraft/bird/drone order depends on ImageFolder sort)
-        # To keep it simple, we train on the existing indices but with a small wrapper via target transform.
-        # Instead: rebuild a mapping of known class indices to compact range.
-        known_class_ids = sorted([class_to_idx["aircraft"], class_to_idx["bird"], class_to_idx["drone"]])
-        compact_map = {old: new for new, old in enumerate(known_class_ids)}
+    train_loader = DataLoader(
+        train_subset,
+        batch_size=args.batch_size,
+        sampler=sampler,
+        num_workers=args.num_workers,
+    )
+    val_loader_known = DataLoader(
+        val_subset_known,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
+    test_loader_known = DataLoader(
+        test_subset_known,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
+    val_loader_unk = DataLoader(
+        val_subset_unk,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
+    test_loader_unk = DataLoader(
+        test_subset_unk,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
 
-        train_subset = CompactSubset(train_subset, compact_map)
-        val_subset_known = CompactSubset(val_subset_known, compact_map)
-        test_subset_known = CompactSubset(test_subset_known, compact_map)
-
-        val_subset_unk = DummyLabelSubset(val_subset_unk)
-        test_subset_unk = DummyLabelSubset(test_subset_unk)
-
-        train_targets_compact = [compact_map[int(targets[i])] for i in known_train_idx]
-        sampler = make_weighted_sampler(train_targets_compact)
-
-        train_loader = DataLoader(train_subset, batch_size=args.batch_size, sampler=sampler, num_workers=args.num_workers)
-        val_loader_known = DataLoader(val_subset_known, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-        val_loader_unk = DataLoader(val_subset_unk, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-        test_loader_known = DataLoader(test_subset_known, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-        test_loader_unk = DataLoader(test_subset_unk, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-
-        num_classes = 3
-        unknown_label = 3  # we will output 3 as "unknown" in OSR post-processing
+    num_classes = 3
+    unknown_label = 3  # emitted by OSR post-processing only
 
     # Train
-    model = build_model(num_classes=num_classes, backbone=args.backbone, pretrained=args.pretrained).to(device)
-    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    model = build_model(
+        num_classes=num_classes, backbone=args.backbone, pretrained=args.pretrained
+    ).to(device)
+    optim = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
 
     best_val = -1.0
     best_path = out_dir / "best_model.pt"
 
     for epoch in range(1, args.epochs + 1):
         tr = run_epoch(model, train_loader, device, optim)
+        va = run_epoch(model, val_loader_known, device, optimizer=None)
+        val_acc = va.acc
 
-        if args.train_unknown == 1:
-            va = run_epoch(model, val_loader, device, optimizer=None)
-            val_acc = va.acc
-            print(f"Epoch {epoch:02d}/{args.epochs} | train loss {tr.loss:.4f} acc {tr.acc:.4f} | val acc {va.acc:.4f}")
-        else:
-            va = run_epoch(model, val_loader_known, device, optimizer=None)
-            val_acc = va.acc
-            print(f"Epoch {epoch:02d}/{args.epochs} | train loss {tr.loss:.4f} acc {tr.acc:.4f} | val(known) acc {va.acc:.4f}")
+        print(
+            f"Epoch {epoch:02d}/{args.epochs} | "
+            f"train loss {tr.loss:.4f} acc {tr.acc:.4f} | "
+            f"val(known) acc {va.acc:.4f}"
+        )
 
         if val_acc > best_val:
             best_val = val_acc
             torch.save({"model_state": model.state_dict(), "args": vars(args)}, best_path)
 
-    print(f"Saved best model: {best_path} (best val={best_val:.4f})")
+    print(f"Saved best model: {best_path} (best val(known)={best_val:.4f})")
     model.load_state_dict(torch.load(best_path, map_location=device)["model_state"])
 
-    # Evaluate
-    if args.train_unknown == 1:
-        logits, y = collect_logits_labels(model, test_loader, device)
-        preds = logits.argmax(axis=1)
-        print("\nClosed-set test report (4-way):")
-        print(classification_report(y, preds, target_names=[idx_to_class[i] for i in range(4)]))
+    # ----------------------------
+    # Evaluation
+    # ----------------------------
+
+    # (A) Closed-set baseline on KNOWN ONLY (3-way)
+    known_logits, known_y = collect_logits_labels(model, test_loader_known, device)
+    known_preds = known_logits.argmax(axis=1)
+
+    print("\nClosed-set KNOWN-only test report (3-way):")
+    print(
+        classification_report(
+            known_y,
+            known_preds,
+            target_names=[compact_idx_to_name[i] for i in range(num_classes)],
+        )
+    )
+
+    # (B) OSR evaluation: threshold-based rejection using UNKNOWN (not training)
+    if len(unk_val_idx) == 0 or len(unk_test_idx) == 0:
+        print(
+            "Warning: unknown set is empty (or too small to split). "
+            "Skipping OSR threshold calibration and open-set evaluation."
+        )
         cfg = {
-            "mode": "closed_set_4way",
-            "class_to_idx": class_to_idx,
-            "idx_to_class": idx_to_class,
+            "mode": "known_only_closed_set",
+            "known_classes": compact_idx_to_name,  # 0..2 -> name
+            "unknown_label": unknown_label,
         }
         (out_dir / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
         return
 
-    # OSR evaluation (3-way + unknown via threshold)
-    known_logits, known_y = collect_logits_labels(model, test_loader_known, device)
-    unk_logits, _ = collect_logits_labels(model, test_loader_unk, device)
-
-    # Threshold calibration using validation known + validation unknown
     osr_method = args.osr_method
     temperature = args.energy_temperature
 
+    # Threshold calibration (val known + val unknown)
     val_known_scores = collect_scores(model, val_loader_known, device, osr_method, temperature)
     val_unk_scores = collect_scores(model, val_loader_unk, device, osr_method, temperature)
     thr = choose_threshold(val_known_scores, val_unk_scores)
@@ -443,27 +520,28 @@ def main():
     print(f"\nOSR method: {method_desc}")
     print(f"Chosen threshold: {thr:.6f} (unknown if score < threshold)")
 
-    # Predict with rejection
+    # Test unknown logits
+    unk_logits, _ = collect_logits_labels(model, test_loader_unk, device)
+
+    # (Optional but useful) Open-set baseline WITHOUT rejection (force argmax among known)
     all_logits = np.concatenate([known_logits, unk_logits], axis=0)
     t = torch.from_numpy(all_logits)
-    
-    # Get OSR scores using selected method
-    scores = get_osr_scores(t, osr_method, temperature).numpy()
-    base_preds = t.argmax(dim=1).numpy()
 
+    base_preds = t.argmax(dim=1).numpy()
+    true = np.concatenate(
+        [known_y, np.full(len(unk_logits), unknown_label, dtype=int)], axis=0
+    )
+
+    # With rejection
+    scores = get_osr_scores(t, osr_method, temperature).numpy()
     pred = base_preds.copy()
     pred[scores < thr] = unknown_label
-
-    true = np.concatenate([known_y, np.full(len(unk_logits), unknown_label)], axis=0)
 
     open_acc = accuracy_score(true, pred)
     true_is_unknown = (true == unknown_label).astype(int)
     pred_is_unknown = (pred == unknown_label).astype(int)
     f1_unk = f1_score(true_is_unknown, pred_is_unknown)
-
-    # AUROC: higher score = more known, so for unknown detection we use (1 - normalized_score)
-    # Actually, we want P(unknown | score), so lower score = more unknown
-    auroc = roc_auc_score(true_is_unknown, -scores)
+    auroc = roc_auc_score(true_is_unknown, -scores)  # lower score => more unknown
 
     print("\nOpen-set results (3 known classes + unknown rejection):")
     print(f"Open-set accuracy: {open_acc:.4f}")
@@ -471,10 +549,6 @@ def main():
     print(f"AUROC unknown-vs-known: {auroc:.4f}")
 
     # Save config for inference
-    # Map compact output indices back to names for inference clarity.
-    # Compact class order is sorted by ImageFolder indices for aircraft/bird/drone.
-    known_class_ids = sorted([class_to_idx["aircraft"], class_to_idx["bird"], class_to_idx["drone"]])
-    compact_idx_to_name = {i: idx_to_class[old] for i, old in enumerate(known_class_ids)}
     cfg = {
         "mode": "osr_threshold",
         "osr_method": osr_method,
@@ -484,7 +558,7 @@ def main():
     }
     if osr_method == "energy":
         cfg["energy_temperature"] = temperature
-    
+
     (out_dir / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     print(f"\nSaved inference config: {out_dir / 'config.json'}")
 
