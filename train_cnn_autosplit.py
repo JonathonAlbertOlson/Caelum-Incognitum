@@ -527,11 +527,33 @@ def main():
     all_logits = np.concatenate([known_logits, unk_logits], axis=0)
     t = torch.from_numpy(all_logits)
 
+
     base_preds = t.argmax(dim=1).numpy()
     true = np.concatenate(
         [known_y, np.full(len(unk_logits), unknown_label, dtype=int)], axis=0
     )
 
+    # --------------------------------------------------
+    # Forced closed-set evaluation (KNOWN + UNKNOWN, no rejection)
+    # --------------------------------------------------
+    forced_acc = accuracy_score(true, base_preds)
+
+    forced_acc_known = accuracy_score(
+        known_y,
+        base_preds[: len(known_y)],
+    )
+
+    forced_acc_unknown = accuracy_score(
+        np.full(len(unk_logits), unknown_label, dtype=int),
+        base_preds[len(known_y) :],
+    )
+
+    print("\nForced closed-set results (UNKNOWNs forced into known classes):")
+    print(f"Overall accuracy: {forced_acc:.4f}")
+    print(f"Accuracy on KNOWN samples: {forced_acc_known:.4f}")
+    print(f"Accuracy on UNKNOWN samples: {forced_acc_unknown:.4f}")
+
+   
     # With rejection
     scores = get_osr_scores(t, osr_method, temperature).numpy()
     pred = base_preds.copy()
