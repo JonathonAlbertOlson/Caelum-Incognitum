@@ -24,11 +24,11 @@ DEVICE = get_device()
 print(f"Using device: {DEVICE}")
 
 # Load config
-with open("outputs/config.json", "r") as f:
+with open("../outputs/config.json", "r") as f:
     CONFIG = json.load(f)
 
 # Load model
-checkpoint = torch.load("outputs/best_model.pt", map_location=DEVICE)
+checkpoint = torch.load("../outputs/best_model.pt", map_location=DEVICE)
 args = checkpoint["args"]
 num_classes = 3 if CONFIG["mode"] == "osr_threshold" else 4
 
